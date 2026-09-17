@@ -1,0 +1,32 @@
+# Local environment / secrets
+.env.local
+.neon
+.env
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Databases (data vit dans Neon)
+*.db
+*.db-journal
+
+# Logs
+*.log
+e2e_result.txt
+server_output.txt
+server_error.txt
+
+# Neon agent skills (locaux)
+skills-lock.json
+.agents/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
