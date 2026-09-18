@@ -1,0 +1,14 @@
+.env.local
+.env
+.neon
+node_modules/
+__pycache__/
+*.pyc
+*.db
+*.log
+server_output.txt
+server_error.txt
+.vercelignore
+.agents/
+skills-lock.json
+whatsapp_generator.db

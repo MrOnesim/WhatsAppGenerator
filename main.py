@@ -7,6 +7,7 @@ import random
 import string
 import asyncio
 import os
+import sys
 import time
 import json
 import hashlib
@@ -16,7 +17,6 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 import phonenumbers
-
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -26,7 +26,7 @@ APP_STARTED = time.time()
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env.local"))
 APPDIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("PGDATABASE_URL")
+DATABASE_URL = (os.getenv("DATABASE_URL") or os.getenv("PGDATABASE_URL") or "").strip().strip('"\x27').strip()
 if not DATABASE_URL:
     raise SystemExit("ERREUR: DATABASE_URL introuvable. Lancez 'neon link' pour generer .env.local, puis redemarrez.")
 if DATABASE_URL.startswith(("postgres://", "postgresql://")):
@@ -43,22 +43,44 @@ db_pool = ConnectionPool(
     kwargs={"row_factory": dict_row},
 )
 
+_db_initialized = False
+
+
+def _get_pool():
+    global _db_initialized
+    if db_pool.closed:
+        db_pool.open()
+    if not _db_initialized:
+        init_db()
+        _db_initialized = True
+    return db_pool
+
 
 @asynccontextmanager
 async def lifespan(app):
-    db_pool.open()
-    init_db()
-    global generated_numbers
-    generated_numbers = load_numbers()
-    load_campaigns()
-    load_templates()
-    load_blacklist_db()
-    load_queue()
-    asyncio.create_task(check_scheduled_campaigns())
+    global _startup_error
+    _startup_error = None
+    if not os.getenv("VERCEL"):
+        db_pool.open()
+    try:
+        init_db()
+        global generated_numbers
+        generated_numbers = load_numbers()
+        load_campaigns()
+        load_templates()
+        load_blacklist_db()
+        load_queue()
+    except Exception as exc:
+        import traceback
+        _startup_error = "".join(traceback.format_exception(exc))
+        print("STARTUP_ERR:", _startup_error, file=sys.stderr)
+    if not os.getenv("VERCEL"):
+        asyncio.create_task(check_scheduled_campaigns())
     try:
         yield
     finally:
-        db_pool.close()
+        if not os.getenv("VERCEL"):
+            db_pool.close()
 
 
 app = FastAPI(title="WhatsApp Number Generator", version="5.0.0", lifespan=lifespan)
@@ -284,6 +306,8 @@ def table_columns(conn, table: str) -> set:
 
 
 def init_db():
+    if db_pool.closed:
+        db_pool.open()
     with db_pool.connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS numbers (
@@ -404,7 +428,7 @@ def init_db():
 
 
 def load_numbers() -> Dict[str, dict]:
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         rows = conn.execute("SELECT * FROM numbers").fetchall()
     result = {}
     for row in rows:
@@ -423,7 +447,7 @@ def load_numbers() -> Dict[str, dict]:
 
 def save_number(num_id: str, data: dict):
     tags_json = json.dumps(data.get("tags", []))
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         conn.execute(
             """INSERT INTO numbers
                (id, number, country_code, city, pattern, status, whatsapp_exists,
@@ -462,7 +486,7 @@ campaign_runners: Dict[str, bool] = {}
 
 
 def save_campaign(camp: dict):
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         conn.execute(
             """INSERT INTO campaigns
                (id, name, country_code, city, plan_count, message, send_after_test,
@@ -495,7 +519,7 @@ def save_campaign(camp: dict):
 
 
 def load_campaigns():
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         rows = conn.execute("SELECT * FROM campaigns ORDER BY created_at DESC").fetchall()
     for row in rows:
         camp = dict(row)
@@ -507,7 +531,7 @@ def load_campaigns():
 # ------------------------- Message Templates -------------------------
 
 def load_templates():
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         rows = conn.execute("SELECT * FROM message_templates ORDER BY created_at DESC").fetchall()
     for row in rows:
         t = dict(row)
@@ -519,7 +543,7 @@ def load_templates():
 
 
 def save_template(template: dict):
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         conn.execute(
             """INSERT INTO message_templates
                (id, name, content, category, variables, created_at, updated_at)
@@ -539,7 +563,7 @@ def save_template(template: dict):
 
 
 def delete_template(template_id: str):
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         conn.execute("DELETE FROM message_templates WHERE id = %s", (template_id,))
         conn.commit()
     message_templates.pop(template_id, None)
@@ -555,7 +579,7 @@ def apply_template(content: str, variables: dict) -> str:
 # ------------------------- Blacklist -------------------------
 
 def load_blacklist_db():
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         rows = conn.execute("SELECT * FROM blacklist ORDER BY added_at DESC").fetchall()
     for row in rows:
         b = dict(row)
@@ -563,7 +587,7 @@ def load_blacklist_db():
 
 
 def save_blacklist_entry(entry: dict):
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         conn.execute(
             """INSERT INTO blacklist (id, number, reason, added_at, added_by)
                VALUES (%s,%s,%s,%s,%s)
@@ -582,7 +606,7 @@ def is_blacklisted(phone_number: str) -> bool:
 
 def add_campaign_log(campaign_id: str, action: str, number: str = None, details: str = None):
     ts = time.time()
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO campaign_logs (campaign_id, action, number, details, timestamp) VALUES (%s,%s,%s,%s,%s)",
             (campaign_id, action, number, details, ts),
@@ -592,7 +616,7 @@ def add_campaign_log(campaign_id: str, action: str, number: str = None, details:
 
 
 def get_campaign_logs(campaign_id: str, limit: int = 100) -> list:
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         rows = conn.execute(
             "SELECT * FROM campaign_logs WHERE campaign_id = %s ORDER BY timestamp DESC LIMIT %s",
             (campaign_id, limit),
@@ -610,7 +634,7 @@ def enqueue_message(number: str, message: str, campaign_id: str = None, priority
         "last_error": None, "created_at": time.time(), "scheduled_at": scheduled_at, "sent_at": None,
     }
     message_queue_store[msg_id] = entry
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         conn.execute(
             """INSERT INTO message_queue
                (id, number, message, campaign_id, priority, status, attempts, max_attempts,
@@ -622,7 +646,7 @@ def enqueue_message(number: str, message: str, campaign_id: str = None, priority
 
 
 def load_queue():
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         rows = conn.execute("SELECT * FROM message_queue").fetchall()
     for row in rows:
         message_queue_store[row["id"]] = dict(row)
@@ -636,7 +660,7 @@ async def process_queue():
         if entry.get("scheduled_at") and entry["scheduled_at"] > now:
             continue
         ok, result = await send_message_via_bridge(entry["number"], entry["message"])
-        with db_pool.connection() as conn:
+        with _get_pool().connection() as conn:
             if ok:
                 entry["status"] = "sent"
                 entry["sent_at"] = time.time()
@@ -1374,7 +1398,7 @@ async def delete_campaign(campaign_id: str):
     if campaign_runners.get(campaign_id):
         raise HTTPException(status_code=400, detail="Arretez la campagne avant de la supprimer")
     camp = campaigns.pop(campaign_id)
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         conn.execute("DELETE FROM campaigns WHERE id = %s", (campaign_id,))
         conn.execute("DELETE FROM campaign_logs WHERE campaign_id = %s", (campaign_id,))
         conn.commit()
@@ -1491,7 +1515,7 @@ async def remove_from_blacklist(entry_id: str):
     if not to_remove:
         raise HTTPException(status_code=404, detail="Blacklist entry not found")
     blacklist_store.pop(to_remove)
-    with db_pool.connection() as conn:
+    with _get_pool().connection() as conn:
         conn.execute("DELETE FROM blacklist WHERE id = %s", (entry_id,))
         conn.commit()
     return {"success": True, "removed": to_remove}
